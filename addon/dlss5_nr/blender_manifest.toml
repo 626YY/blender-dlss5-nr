@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "dlss5_nr"
-version = "0.10.1"
+version = "0.10.2"
 name = "DLSS 5 Neural Rendering"
 tagline = "Live DLSS 5 Neural Rendering over the viewport (GPU or CPU route), plus F12 results and EEVEE guide capture"
 maintainer = "blender-dlss5-nr contributors"

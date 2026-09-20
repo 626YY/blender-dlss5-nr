@@ -61,10 +61,17 @@ copies are not. That is the whole argument for the GPU route.
   and overwrites *Render Result*.
 - `PrintWindow(hwnd, PW_CLIENTONLY | PW_RENDERFULLCONTENT)` returns Blender's DWM-composed window
   including the GL viewports (16–30 ms for 2560×1377). That is the CPU route's capture.
+- `DwmGetDxSharedSurface` (undocumented, exported by user32 since Windows 8) hands out the DWM
+  redirection surface of a window as a shareable D3D11 texture: `B8G8R8A8_UNORM`, the size of
+  `GetWindowRect` (including the invisible resize border; client origin = `ClientToScreen(0,0)` minus
+  the window rect's top-left). No capture session, so no Windows 10 capture border, no CPU copy, and
+  the surface never contains our overlay. This is the GPU route's default capture. The update id it
+  returns ticks with every composition, so the 32×32 luma thumbnail still decides whether the picture
+  changed. Falls back to the two below when the call fails or the window lives on another GPU.
 - `Windows.Graphics.Capture` of the Blender window (C++/WinRT: `IGraphicsCaptureItemInterop::
   CreateForWindow`, a free-threaded `Direct3D11CaptureFramePool`) gives the window's DWM surface as a
   D3D11 texture with zero CPU involvement, and — being per-window — never contains our own overlay,
-  so the overlay can stay visible to screen recorders. That is the GPU route's default capture
+  so the overlay can stay visible to screen recorders. First fallback
   (verified: with a static viewport the frame counter stops at 1). Windows 10 19045 rejects
   `IsBorderRequired = false`, so the yellow capture border stays there; Windows 11 honours it.
 - DXGI Desktop Duplication is the fallback (`capture: "dda"`): same texture path, but it sees the
@@ -73,10 +80,10 @@ copies are not. That is the whole argument for the GPU route.
 
 ## 5. The GPU route, per frame
 
-1. `TryGetNextFrame` (window capture) or `AcquireNextFrame` (desktop duplication, skipping frames
-   whose dirty/move rects miss the viewport); copy the viewport rectangle (client origin mapped into
-   the captured surface via `DWMWA_EXTENDED_FRAME_BOUNDS`) into a shared `B8G8R8A8` texture; D3D11
-   `Signal` a shared fence.
+1. Read the window's DWM surface (`DwmGetDxSharedSurface`), or `TryGetNextFrame` with window capture,
+   or `AcquireNextFrame` with desktop duplication (skipping frames whose dirty/move rects miss the
+   viewport); copy the viewport rectangle into a shared `B8G8R8A8` texture; D3D11 `Signal` a shared
+   fence.
 2. D3D12 `Wait` on that fence → decode pass (sRGB → linear RGBA16F, optional 2×2 average for the
    half-resolution mode) + a 32×32 luma thumbnail (read back, 4 KB, to skip unchanged pictures).
 3. `RecordEncodeSrgb` (what the model expects) → NVOF motion vectors (previous frame → current) →

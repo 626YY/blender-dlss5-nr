@@ -57,7 +57,7 @@ struct Cfg {
     float detail = 1.0f;
     float colour = 0.0f;         // 0 keep original hue (COLOR mode), 1 model colour (FULL)
     bool bench = false;
-    bool preferWgc = true;       // per-window capture (recorders see the overlay; Win10 draws a yellow border)
+    std::string capture = "auto";  // auto | dwm | wgc | dda (see the backend selection in RunLive)
     std::string dump;            // debug: write the next presented frame to this PNG path
     unsigned gen = 0;            // any change -> re-present
     unsigned modelGen = 0;       // model params changed -> re-create the feature
@@ -70,8 +70,11 @@ struct Stats {
     std::atomic<bool> running{true};
     std::mutex mu;
     std::string err;
+    std::string capture;         // active capture backend: dwm / wgc / dda
     void SetErr(const std::string& e) { std::lock_guard<std::mutex> g(mu); err = e; }
     std::string Err() { std::lock_guard<std::mutex> g(mu); return err; }
+    void SetCapture(const std::string& c) { std::lock_guard<std::mutex> g(mu); capture = c; }
+    std::string CaptureName() { std::lock_guard<std::mutex> g(mu); return capture; }
 };
 
 // ---------------------------------------------------------------------------
@@ -130,10 +133,10 @@ std::string StatusJson(Stats& st) {
     char buf[512];
     snprintf(buf, sizeof(buf),
              "{\"ok\":1,\"fps\":%.2f,\"ms\":%.1f,\"nr_ms\":%.1f,\"cap_ms\":%.1f,\"frames\":%lld,"
-             "\"visible\":%s,\"running\":%s,\"err\":\"%s\",\"route\":\"gpu\"}",
+             "\"visible\":%s,\"running\":%s,\"err\":\"%s\",\"capture\":\"%s\",\"route\":\"gpu\"}",
              st.fps.load(), st.ms.load(), st.nrMs.load(), st.capMs.load(), st.frames.load(),
              st.visible.load() ? "true" : "false", st.running.load() ? "true" : "false",
-             JEscape(st.Err()).c_str());
+             JEscape(st.Err()).c_str(), st.CaptureName().c_str());
     return buf;
 }
 
@@ -164,7 +167,7 @@ void ApplyCfg(const JVal& j, Cfg& c) {
     }
     c.half = j.boolean("half", c.half);
     c.bench = j.boolean("bench", c.bench);
-    if (j.has("capture")) c.preferWgc = (j.str("capture", "wgc") != "dda");
+    if (j.has("capture")) c.capture = j.str("capture", "auto");
     if (j.has("dump")) c.dump = j.str("dump", "");
     // composition
     if (j.has("mode")) {
@@ -442,7 +445,106 @@ public:
         }
     }
 
+    // ---- The DWM redirection surface of the Blender window (DwmGetDxSharedSurface, undocumented) ----
+    // The texture DWM composes for the window: no capture session (so none of Windows 10's yellow
+    // capture border), no CPU copy, and it never contains our overlay (a separate window). Exported by
+    // user32.dll since Windows 8. Re-queried every frame: DWM replaces the surface when the window
+    // resizes, and the update id tells us when there is something new.
+    bool Dwm() const { return m_dwm; }
+    bool StartDwm(HWND hwnd, std::string* err) {
+        StopDwm();
+        if (!m_dwmFn) {
+            m_dwmFn = reinterpret_cast<PfnDwmGetDxSharedSurface>(
+                GetProcAddress(GetModuleHandleW(L"user32.dll"), "DwmGetDxSharedSurface"));
+        }
+        if (!m_dwmFn) { *err = "DWM surface: DwmGetDxSharedSurface not exported by user32"; return false; }
+        if (!OpenDwmSurface(hwnd, err)) return false;
+        m_dwmHwnd = hwnd;
+        m_dwm = true;
+        return true;
+    }
+    void StopDwm() {
+        m_dwmTex.Reset();
+        m_dwmHandle = nullptr;
+        m_dwmHwnd = nullptr;
+        m_dwmSeen = 0;
+        m_dwm = false;
+    }
+    // l,t,w,h are Blender client coordinates. 1 = copied, 0 = nothing new, -1 = lost.
+    int AcquireDwm(HWND hwnd, int l, int t, int w, int h, bool force, std::string* err) {
+        if (!m_dwm || hwnd != m_dwmHwnd) return -1;
+        if (!EnsureShared(w, h, err)) return -1;
+        HANDLE hs = nullptr;
+        LUID luid{};
+        ULONG fmt = 0, flags = 0;
+        ULONGLONG upd = 0;
+        if (!m_dwmFn(hwnd, &hs, &luid, &fmt, &flags, &upd)) {
+            *err = "DWM surface lost (" + std::to_string(GetLastError()) + ")";
+            return -1;
+        }
+        if (hs != m_dwmHandle && !OpenDwmSurface(hwnd, err)) return -1;   // resized: DWM made a new surface
+        if (!force && upd == m_dwmSeen) return 0;
+        m_dwmSeen = upd;
+        // Surface pixel (0,0) is the top-left of the window rectangle (including the invisible resize border).
+        RECT wr{};
+        GetWindowRect(hwnd, &wr);
+        POINT co{0, 0};
+        ClientToScreen(hwnd, &co);
+        const int ox = co.x - wr.left + l, oy = co.y - wr.top + t;
+        D3D11_BOX box{};
+        box.left = static_cast<UINT>(std::max(0, ox));
+        box.top = static_cast<UINT>(std::max(0, oy));
+        box.right = static_cast<UINT>(std::min<int>(m_dwmW, ox + w));
+        box.bottom = static_cast<UINT>(std::min<int>(m_dwmH, oy + h));
+        box.front = 0;
+        box.back = 1;
+        if (box.right <= box.left || box.bottom <= box.top) return 0;
+        m_ctx->CopySubresourceRegion(m_shared.Get(), 0, 0, 0, 0, m_dwmTex.Get(), 0, &box);
+        m_ctx->Flush();
+        m_ctx4->Signal(m_fence11.Get(), ++m_fenceVal);
+        m_haveFrame = true;
+        return 1;
+    }
+
 private:
+    using PfnDwmGetDxSharedSurface = BOOL(WINAPI*)(HWND, HANDLE*, LUID*, ULONG*, ULONG*, ULONGLONG*);
+    bool OpenDwmSurface(HWND hwnd, std::string* err) {
+        HANDLE hs = nullptr;
+        LUID luid{};
+        ULONG fmt = 0, flags = 0;
+        ULONGLONG upd = 0;
+        if (!m_dwmFn(hwnd, &hs, &luid, &fmt, &flags, &upd)) {
+            *err = "DWM surface: DwmGetDxSharedSurface failed (" + std::to_string(GetLastError()) + ")";
+            return false;
+        }
+        DXGI_ADAPTER_DESC1 ad{};
+        m_adapter->GetDesc1(&ad);
+        if (ad.AdapterLuid.LowPart != luid.LowPart || ad.AdapterLuid.HighPart != luid.HighPart) {
+            *err = "DWM surface: the window is composed on another GPU";
+            return false;
+        }
+        ComPtr<ID3D11Texture2D> tex;
+        HRESULT hr = m_dev->OpenSharedResource(hs, IID_PPV_ARGS(&tex));
+        if (FAILED(hr)) { *err = "DWM surface: OpenSharedResource " + HrToString(hr); return false; }
+        D3D11_TEXTURE2D_DESC td{};
+        tex->GetDesc(&td);
+        if (td.Format != DXGI_FORMAT_B8G8R8A8_UNORM) {
+            *err = "DWM surface: unexpected format " + std::to_string(static_cast<int>(td.Format));
+            return false;
+        }
+        m_dwmTex = tex;
+        m_dwmHandle = hs;
+        m_dwmW = static_cast<int>(td.Width);
+        m_dwmH = static_cast<int>(td.Height);
+        return true;
+    }
+    PfnDwmGetDxSharedSurface m_dwmFn = nullptr;
+    ComPtr<ID3D11Texture2D> m_dwmTex;
+    HANDLE m_dwmHandle = nullptr;
+    HWND m_dwmHwnd = nullptr;
+    int m_dwmW = 0, m_dwmH = 0;
+    ULONGLONG m_dwmSeen = 0;
+    bool m_dwm = false;
     winrt::Windows::Graphics::Capture::GraphicsCaptureItem m_item{nullptr};
     winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool m_pool{nullptr};
     winrt::Windows::Graphics::Capture::GraphicsCaptureSession m_session{nullptr};
@@ -908,9 +1010,10 @@ int RunLive(const LiveArgs& args) {
     std::vector<double> stamps;
     auto lastStat = std::chrono::steady_clock::now();
     HMONITOR curMon = nullptr;
-    HWND capHwnd = nullptr;          // window the capture (WGC or DDA) is bound to
-    bool capWgcPref = true;
-    bool useDda = false;             // fallback when WGC is unavailable or not wanted
+    HWND capHwnd = nullptr;          // window the capture is bound to
+    std::string capPref;             // requested backend: auto / dwm / wgc / dda
+    enum class CapMode { None, Dwm, Wgc, Dda };
+    CapMode capMode = CapMode::None;
 
     auto releaseFeature = [&]() {
         if (feature) {
@@ -956,25 +1059,38 @@ int RunLive(const LiveArgs& args) {
             if (!args.headless && overlay.Owner() != c.hwnd) {
                 if (!overlay.Create(c.hwnd, &err)) throw ToolError(err);
             }
-            // Capture backend, bound to the Blender window: per-window capture first (recorders can
-            // see the overlay), desktop duplication + self-exclusion as the fallback.
-            if (capHwnd != c.hwnd || capWgcPref != c.preferWgc) {
+            // Capture backend, bound to the Blender window. Order for "auto":
+            //   dwm - the window's DWM surface: no capture session (no Windows 10 border), recordable overlay
+            //   wgc - Windows.Graphics.Capture of the window: recordable overlay, yellow border on Windows 10
+            //   dda - desktop duplication: the overlay must exclude itself from capture (invisible to recorders)
+            if (capHwnd != c.hwnd || capPref != c.capture) {
                 capHwnd = c.hwnd;
-                capWgcPref = c.preferWgc;
-                useDda = !c.preferWgc || !cap.StartWgc(c.hwnd, &err);
-                if (useDda) {
-                    cap.StopWgc();
-                    if (c.preferWgc) LogWarn("%s -> falling back to desktop duplication", err.c_str());
+                capPref = c.capture;
+                cap.StopWgc();
+                cap.StopDwm();
+                capMode = CapMode::None;
+                std::string why;
+                if (c.capture == "auto" || c.capture == "dwm") {
+                    if (cap.StartDwm(c.hwnd, &err)) capMode = CapMode::Dwm; else why += err + "; ";
+                }
+                if (capMode == CapMode::None && (c.capture == "auto" || c.capture == "wgc")) {
+                    if (cap.StartWgc(c.hwnd, &err)) { capMode = CapMode::Wgc; } else { cap.StopWgc(); why += err + "; "; }
+                }
+                if (capMode == CapMode::None) {
+                    capMode = CapMode::Dda;
+                    if (c.capture != "dda") LogWarn("%s-> falling back to desktop duplication", why.c_str());
                     LogInfo("capture: desktop duplication (overlay excluded from screen recorders)");
                     if (!args.headless) overlay.SetExcludeFromCapture(true);
                     curMon = nullptr;
                 } else {
-                    LogInfo("capture: Windows.Graphics.Capture of the Blender window");
+                    LogInfo("capture: %s", capMode == CapMode::Dwm ? "DWM surface of the Blender window (no capture border)"
+                                                                   : "Windows.Graphics.Capture of the Blender window");
                     if (!args.headless) overlay.SetExcludeFromCapture(false);
                 }
+                stats.SetCapture(capMode == CapMode::Dwm ? "dwm" : capMode == CapMode::Wgc ? "wgc" : "dda");
             }
             HMONITOR mon = MonitorFromWindow(c.hwnd, MONITOR_DEFAULTTONEAREST);
-            if (useDda && (mon != curMon || cap.Monitor() != mon)) {
+            if (capMode == CapMode::Dda && (mon != curMon || cap.Monitor() != mon)) {
                 if (!cap.SelectOutput(mon, &err)) throw ToolError(err);
                 curMon = mon;
             }
@@ -1037,8 +1153,10 @@ int RunLive(const LiveArgs& args) {
 
             // ---- capture ----
             const auto tCap0 = std::chrono::steady_clock::now();
-            int got = useDda ? cap.Acquire(screen, c.bench || needReset, &err)
-                             : cap.AcquireWgc(c.hwnd, l, t, w, h, c.bench || needReset, &err);
+            const bool forceCap = c.bench || needReset;
+            int got = capMode == CapMode::Dda ? cap.Acquire(screen, forceCap, &err)
+                    : capMode == CapMode::Dwm ? cap.AcquireDwm(c.hwnd, l, t, w, h, forceCap, &err)
+                                              : cap.AcquireWgc(c.hwnd, l, t, w, h, forceCap, &err);
             if (got < 0) {
                 if (!err.empty()) LogWarn("capture: %s (restarting capture)", err.c_str());
                 curMon = nullptr;
@@ -1206,6 +1324,7 @@ int RunLive(const LiveArgs& args) {
     stats.running = false;
     quit = true;
     cap.StopWgc();
+    cap.StopDwm();
     if (!args.headless) overlay.Destroy();
     releaseFeature();
     nvof.Shutdown();

@@ -15,7 +15,16 @@ def cb(hwnd, lp):
             found.append(hwnd)
     return True
 user32.EnumWindows(proto(cb), 0)
-hwnd = int(found[0]); print("blender hwnd", hex(hwnd))
+user32.GetClientRect.argtypes = [VP, ctypes.POINTER(W.POINT)]; user32.IsIconic.argtypes = [VP]
+def _area(h):
+    r = W.RECT(); user32.GetClientRect(VP(h), ctypes.cast(ctypes.byref(r), ctypes.POINTER(W.POINT))); return 0 if user32.IsIconic(VP(h)) else r.right * r.bottom
+found.sort(key=_area, reverse=True)   # several Blender windows: take the big, non-minimised one
+hwnd = int(found[0]) if found else 0
+for a in sys.argv:
+    if a.startswith("--hwnd="):        # --hwnd=fg (the foreground window) or --hwnd=0x1234: drive any window
+        user32.GetForegroundWindow.restype = VP
+        hwnd = int(user32.GetForegroundWindow() or 0) if a[7:] == "fg" else int(a[7:], 0)
+print("target hwnd", hex(hwnd), "blender windows", [hex(int(h)) for h in found])
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 rect = [int(x) for x in args[:4]] if len(args) >= 4 else [2, 26, 1353, 1056]
 extra = ["--headless"] if "--headless" in sys.argv else []
@@ -33,6 +42,9 @@ t0 = time.time(); hello = json.loads(p.stdout.readline()); print("hello %.1fs" %
 cfg = dict(hwnd=hwnd, rect=rect, holes=[[0, 0, rect[2], 26]], split=0.5, view="SPLIT", half=half, style=2, tone=0.0, structure=2.0, skin=1.5, automask=True, mode="COLOR", strength=1.0, bench=("--bench" in sys.argv))
 if "--dump" in sys.argv:
     cfg["dump"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live_gpu_dump.png").replace("\\", "/")
+for a in sys.argv:
+    if a.startswith("--cap="):          # --cap=auto|dwm|wgc|dda
+        cfg["capture"] = a[6:]
 
 
 def screen_shot(path):

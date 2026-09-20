@@ -45,3 +45,12 @@ copied from NVIDIA's DLSS SDK repository: https://github.com/NVIDIA/DLSS, folder
 - The capture is C++/WinRT (`winrt/Windows.Graphics.Capture.h`, part of the Windows SDK since
   10.0.17763) and links `windowsapp.lib` + `dwmapi.lib`; no NuGet package is needed. The compiler
   needs `/EHsc` and C++17, which `build.bat` sets.
+
+## Probe: `native/dlss5_live/experiments/dwmtest.cpp`
+
+Prints the geometry of a window's DWM shared surface (`DwmGetDxSharedSurface`), watches its update id for 3 s and
+dumps it to `dwm_surface.png`. Build from a VS/portable-MSVC prompt:
+
+```bat
+cl /std:c++17 /EHsc /O2 /I ..\..\video2dlssnr\third_party\stb dwmtest.cpp /link d3d11.lib dxgi.lib dwmapi.lib user32.lib
+```

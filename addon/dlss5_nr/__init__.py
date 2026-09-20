@@ -57,7 +57,7 @@ from . import nr_math
 bl_info = {
     "name": "DLSS 5 神经渲染 + EEVEE 引导通道",
     "author": "built in-session",
-    "version": (0, 10, 1),
+    "version": (0, 10, 2),
     "blender": (5, 0, 0),
     "location": "3D 视图 > 侧边栏 > DLSS NR",
     "description": "DLSS 5 神经渲染(视口 / F12 结果),以及 EEVEE 引导通道捕获",
@@ -504,7 +504,7 @@ VIEW_ITEMS = [
 
 class _Live:
     """实时模式,两条路,协议相同(hwnd / 视口矩形 / 参数 -> 状态):
-    GPU 路:dlss5_live.exe(C++,桌面复制 -> D3D12 -> NGX -> DirectComposition 浮窗,全程不下 GPU,
+    GPU 路:dlss5_live.exe(C++,DWM 窗口表面/按窗口捕获/桌面复制 -> D3D12 -> NGX -> DirectComposition 浮窗,全程不下 GPU,
            全分辨率 50-60 帧/秒);
     CPU 路:工作进程里的 nr_monitor.py(PrintWindow -> numpy -> NGX -> GDI 分层窗,约 20 帧/秒)。
     Blender 这边只负责:告诉它 窗口句柄 / 视口矩形 / 参数,定时拿状态。"""
@@ -521,6 +521,7 @@ class _Live:
     frames = 0
     size = (0, 0)
     visible = False
+    capture = ""            # GPU 路实际用的抓取方式: dwm / wgc / dda
 
 
 class _GpuLive:
@@ -719,7 +720,7 @@ def _live_cfg(win, area, region, settings):
                 automask=bool(settings.nr_automask), mode=settings.nr_mode,
                 strength=float(settings.nr_strength), half=bool(settings.nr_live_half),
                 split=float(settings.nr_split), view=settings.nr_view,
-                capture=("dda" if settings.nr_live_capture == "DDA" else "wgc")), (rx, ry, rw, rh)
+                capture=settings.nr_live_capture.lower()), (rx, ry, rw, rh)
 
 
 def _live_send(action, cfg=None):
@@ -763,6 +764,7 @@ def _live_tick():
         _Live.frames = int(obj.get("frames", 0))
         _Live.size = tuple(obj.get("size", (0, 0)))
         _Live.visible = bool(obj.get("visible", False))
+        _Live.capture = obj.get("capture", "") or ""
         _Live.err = obj.get("err", "") or ""
         if not obj.get("running", True):
             _live_stop()
@@ -1834,14 +1836,17 @@ class DLSSNR_Settings(PropertyGroup):
     nr_live: BoolProperty(name="实时模式", default=False, options={"SKIP_SAVE"})
     nr_live_capture: EnumProperty(
         name="GPU 路抓取方式",
-        items=[("WGC", "按窗口(可录屏)", "Windows.Graphics.Capture 只抓 Blender 窗口:录屏/截图都能看到浮窗;"
-                                         "Win10 会在 Blender 窗口边缘画一圈黄色捕获边框(Win11 没有)"),
-               ("DDA", "桌面复制(无黄框)", "抓整个桌面,浮窗必须对录屏隐藏(否则会把自己再喂给自己)")],
-        default="WGC")
+        items=[("AUTO", "自动", "依次尝试:DWM 窗口表面 -> 按窗口捕获 -> 桌面复制"),
+               ("DWM", "DWM 窗口表面(无黄框,可录屏)", "直接读 DWM 为 Blender 窗口合成的表面:没有捕获会话,"
+                                                    "所以没有 Win10 的黄色边框;录屏/截图都能看到浮窗"),
+               ("WGC", "按窗口捕获(可录屏)", "Windows.Graphics.Capture 只抓 Blender 窗口:录屏/截图都能看到浮窗;"
+                                             "Win10 会在 Blender 窗口边缘画一圈黄色捕获边框(Win11 没有)"),
+               ("DDA", "桌面复制(录屏看不到浮窗)", "抓整个桌面,浮窗必须对录屏隐藏(否则会把自己再喂给自己)")],
+        default="AUTO")
     nr_route: EnumProperty(
         name="实时路线",
         items=[("AUTO", "自动", "有 dlss5_live.exe 就走 GPU 路,否则 CPU 路"),
-               ("GPU", "GPU", "dlss5_live.exe:桌面复制 -> D3D12 -> NGX -> 浮窗,全分辨率 50-60 帧"),
+               ("GPU", "GPU", "dlss5_live.exe:窗口表面 -> D3D12 -> NGX -> 浮窗,全分辨率 50-60 帧"),
                ("CPU", "CPU", "Python 工作进程:PrintWindow -> numpy -> NGX -> GDI 浮窗,约 20 帧")],
         default="AUTO")
     nr_live_exe: StringProperty(name="dlss5_live.exe", subtype="FILE_PATH", default="",
@@ -1914,8 +1919,8 @@ class DLSSNR_PT_panel(Panel):
             layout.label(text=(_Worker.err or _Live.err)[:44], icon="ERROR")
         elif _Live.enabled:
             layout.label(text="%s · %.1f 帧/秒 · NR %.1fms%s" % (
-                "GPU" if _Live.route == "gpu" else "CPU", _Live.fps, _Live.nr_ms,
-                "" if _Live.visible else " · 等待画面"), icon="TIME")
+                ("GPU·" + _Live.capture.upper() if _Live.capture else "GPU") if _Live.route == "gpu" else "CPU",
+                _Live.fps, _Live.nr_ms, "" if _Live.visible else " · 等待画面"), icon="TIME")
             layout.prop(s, "nr_live_half", text="半分辨率(更流畅)")
 
         if _Overlay.tex is not None or _Live.enabled:
