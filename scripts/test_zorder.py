@@ -40,7 +40,11 @@ def cb(hwnd, lp):
             found.append(hwnd)
     return True
 user32.EnumWindows(proto(cb), 0)
-hwnd = int(found[0]); print("blender hwnd", hex(hwnd))
+user32.GetClientRect.argtypes = [VP, ctypes.POINTER(W.RECT)]
+def _area(h):
+    r = W.RECT(); user32.GetClientRect(VP(h), ctypes.byref(r)); return 0 if user32.IsIconic(VP(h)) else r.right * r.bottom
+found.sort(key=_area, reverse=True)   # several Blender windows: take the big, non-minimised one
+hwnd = int(found[0]); print("blender hwnd", hex(hwnd), "of", [hex(int(h)) for h in found])
 user32.GetForegroundWindow.restype = VP
 blender_in_use = int(user32.GetForegroundWindow() or 0) == hwnd
 if blender_in_use:
