@@ -1,0 +1,23 @@
+# binaries and NVIDIA files never go in the tree
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.obj
+*.ilk
+!addon/dlss5_nr/bin/README.md
+addon/dlss5_nr/bin/*
+!addon/dlss5_nr/bin/README.md
+native/dlss5_live/build/
+native/dlss5_live/out/
+
+# python
+__pycache__/
+*.pyc
+
+# local
+*.log
+*.npy
+*.ppm
+/tmp/
