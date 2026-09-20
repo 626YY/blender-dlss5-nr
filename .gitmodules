@@ -1,0 +1,3 @@
+[submodule "native/video2dlssnr"]
+	path = native/video2dlssnr
+	url = https://github.com/DaniilSokolyuk/video2dlssnr.git

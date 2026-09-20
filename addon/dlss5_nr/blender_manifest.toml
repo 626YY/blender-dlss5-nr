@@ -1,0 +1,28 @@
+schema_version = "1.0.0"
+
+id = "dlss5_nr"
+version = "0.10.0"
+name = "DLSS 5 Neural Rendering"
+tagline = "Live DLSS 5 Neural Rendering over the viewport (GPU or CPU route), plus F12 results and EEVEE guide capture"
+maintainer = "blender-dlss5-nr contributors"
+type = "add-on"
+
+blender_version_min = "5.0.0"
+
+license = ["SPDX:MIT"]
+copyright = [
+  "2026 blender-dlss5-nr contributors",
+]
+
+tags = ["Render", "Pipeline"]
+platforms = ["windows-x64"]
+
+[permissions]
+files = "Write NR results / guide EXR files to a directory you choose; spawn the NR worker process"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "*.pyc",
+  ".git/",
+]
