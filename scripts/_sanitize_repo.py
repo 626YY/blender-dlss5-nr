@@ -34,7 +34,8 @@ for f in ("nr_sweep.py", "nr_sweep2.py", "style_sweep.py", "test_worker.py", "te
         ('ROOT = r"H:\\ComfyUI-aki-v1.4\\custom_nodes\\ComfyUI-DLSS5-NR"', "ROOT = " + ENV_ROOT),
         ('BPY = r"H:\\blender-5.1.2-windows-x64\\5.1\\python\\bin\\python.exe"', "BPY = " + ENV_BPY),
     ], must_change=False)
-sub("scripts/test_live.py", [
+for f in ("test_live.py", "test_zorder.py"):
+    sub("scripts/" + f, [
     ('EXE = r"H:\\ZLHTD\\src\\dlss5_live\\out\\dlss5_live.exe"',
      'EXE = os.environ.get("DLSS5_LIVE_EXE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "native", "dlss5_live", "out", "dlss5_live.exe"))'),
     ('DLLDIR = r"H:\\dpsk\\dlss5-eevee\\video2dlssnr\\out"',

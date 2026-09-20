@@ -41,4 +41,7 @@ copied from NVIDIA's DLSS SDK repository: https://github.com/NVIDIA/DLSS, folder
   intermediate texture and `CopyResource`s it into the back buffer.
 - Blender 5.1's OpenGL backend: `GPUOffScreen.draw_view3d` works, but only in MATERIAL/SOLID shading
   (in RENDERED it ignores scene lights); the Python `read_color()` of the viewport framebuffer only
-  ever returns the overlay layer. Hence the desktop-duplication design of the GPU route.
+  ever returns the overlay layer. Hence the window-capture design of the GPU route.
+- The capture is C++/WinRT (`winrt/Windows.Graphics.Capture.h`, part of the Windows SDK since
+  10.0.17763) and links `windowsapp.lib` + `dwmapi.lib`; no NuGet package is needed. The compiler
+  needs `/EHsc` and C++17, which `build.bat` sets.

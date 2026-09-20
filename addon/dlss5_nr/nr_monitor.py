@@ -330,7 +330,10 @@ class Monitor:
             self.err = "NR 线程: %s" % exc
 
     # ------------------------------------------------------------ 3. 呈现线程(拥有窗口)
-    def _create_window(self):
+    def _create_window(self, owner):
+        """浮窗做成 Blender 窗口的从属窗口(owner):Windows 保证它只在 Blender 正上方、跟着
+        Blender 的前后层级走,别的程序盖住 Blender 它也被盖住,Blender 最小化它也藏。
+        抓取用的是 PrintWindow(按窗口),浮窗不需要防截屏,录屏软件能看到它。"""
         hinst = kernel32.GetModuleHandleW(None)
         if not self._cls_registered:
             self._wndproc = WNDPROC(lambda h, m, wp, lp: user32.DefWindowProcW(h, m, wp, lp))
@@ -340,35 +343,12 @@ class Monitor:
             wc.lpszClassName = "DLSS5_NR_Monitor"
             user32.RegisterClassW(ctypes.byref(wc))       # 重复注册会失败(1410),无所谓
             self._cls_registered = True
-        ex = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+        ex = WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
         hwnd = user32.CreateWindowExW(ex, "DLSS5_NR_Monitor", "DLSS 5 NR", WS_POPUP,
-                                      0, 0, 8, 8, None, None, hinst, None)
+                                      0, 0, 8, 8, owner, None, hinst, None)
         if not hwnd:
             raise RuntimeError("CreateWindowExW 失败: %d" % ctypes.get_last_error())
-        try:
-            user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)   # 录屏/截图工具看不到它
-        except Exception:                                   # noqa: BLE001
-            pass
         return hwnd
-
-    def _covered_by_other(self, hwnd_b, rect):
-        """前台窗口既不是 Blender 也不是我们,而且它的矩形和视口矩形相交 -> 视口被挡住了。"""
-        try:
-            fg = user32.GetForegroundWindow()
-            if not fg:
-                return False
-            root = user32.GetAncestor(fg, GA_ROOT) or fg
-            if root == hwnd_b or fg == hwnd_b or fg == self._hwnd or root == self._hwnd:
-                return False
-            r = W.RECT()
-            if not user32.GetWindowRect(root, ctypes.byref(r)):
-                return False
-            pt = W.POINT(int(rect[0]), int(rect[1]))
-            user32.ClientToScreen(hwnd_b, ctypes.byref(pt))
-            x0, y0, x1, y1 = pt.x, pt.y, pt.x + int(rect[2]), pt.y + int(rect[3])
-            return not (r.right <= x0 or r.left >= x1 or r.bottom <= y0 or r.top >= y1)
-        except Exception:                                   # noqa: BLE001
-            return False
 
     def _pump(self):
         msg = W.MSG()
@@ -380,22 +360,32 @@ class Monitor:
         out_dib = None
         shown = False
         buf_f = None                 # 复用的全分辨率 float32 缓冲
+        owner = None
         try:
             try:
                 user32.SetProcessDpiAwarenessContext(VP(-4))
             except Exception:                               # noqa: BLE001
                 pass
-            self._hwnd = self._create_window()
             while self.running:
                 self._pump()
                 cfg = self._get_cfg()
                 view = cfg.get("view", "SPLIT")
                 hwnd_b = cfg.get("hwnd")
                 headless = bool(cfg.get("headless", False))
+                if hwnd_b and user32.IsWindow(hwnd_b) and owner != hwnd_b:
+                    if self._hwnd:
+                        try:
+                            user32.DestroyWindow(self._hwnd)
+                        except Exception:                   # noqa: BLE001
+                            pass
+                        self._hwnd = None
+                        shown = False
+                    self._hwnd = self._create_window(hwnd_b)
+                    owner = hwnd_b
                 hide = (view == "ORIG" or not hwnd_b or not user32.IsWindow(hwnd_b) or user32.IsIconic(hwnd_b)
-                        or (not headless and self._covered_by_other(hwnd_b, cfg.get("rect"))))
+                        or not self._hwnd)
                 if hide:
-                    if shown:
+                    if shown and self._hwnd:
                         user32.ShowWindow(self._hwnd, SW_HIDE)
                         shown = False
                     self.stats["visible"] = False
@@ -430,7 +420,6 @@ class Monitor:
                     if not shown:
                         user32.ShowWindow(self._hwnd, SW_SHOWNOACTIVATE)
                         shown = True
-                    user32.SetWindowPos(self._hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOMOVE)
                     if not user32.UpdateLayeredWindow(self._hwnd, None, ctypes.byref(dst), ctypes.byref(size),
                                                       out_dib.hdc, ctypes.byref(src), 0, ctypes.byref(blend), ULW_ALPHA):
                         self.err = "UpdateLayeredWindow 失败: %d" % ctypes.get_last_error()

@@ -61,14 +61,22 @@ copies are not. That is the whole argument for the GPU route.
   and overwrites *Render Result*.
 - `PrintWindow(hwnd, PW_CLIENTONLY | PW_RENDERFULLCONTENT)` returns Blender's DWM-composed window
   including the GL viewports (16–30 ms for 2560×1377). That is the CPU route's capture.
-- DXGI Desktop Duplication gives the same pixels as a D3D11 texture with zero CPU involvement; the
-  overlay window sets `WDA_EXCLUDEFROMCAPTURE` so it does not feed itself back (verified: with a
-  static viewport the frame counter stops at 1). That is the GPU route's capture.
+- `Windows.Graphics.Capture` of the Blender window (C++/WinRT: `IGraphicsCaptureItemInterop::
+  CreateForWindow`, a free-threaded `Direct3D11CaptureFramePool`) gives the window's DWM surface as a
+  D3D11 texture with zero CPU involvement, and — being per-window — never contains our own overlay,
+  so the overlay can stay visible to screen recorders. That is the GPU route's default capture
+  (verified: with a static viewport the frame counter stops at 1). Windows 10 19045 rejects
+  `IsBorderRequired = false`, so the yellow capture border stays there; Windows 11 honours it.
+- DXGI Desktop Duplication is the fallback (`capture: "dda"`): same texture path, but it sees the
+  whole screen, so the overlay window must set `WDA_EXCLUDEFROMCAPTURE` to avoid feeding itself
+  back — which also hides it from recorders. No border.
 
 ## 5. The GPU route, per frame
 
-1. `AcquireNextFrame`; skip unless a dirty/move rect touches the viewport rectangle; copy the
-   rectangle into a shared `B8G8R8A8` texture; D3D11 `Signal` a shared fence.
+1. `TryGetNextFrame` (window capture) or `AcquireNextFrame` (desktop duplication, skipping frames
+   whose dirty/move rects miss the viewport); copy the viewport rectangle (client origin mapped into
+   the captured surface via `DWMWA_EXTENDED_FRAME_BOUNDS`) into a shared `B8G8R8A8` texture; D3D11
+   `Signal` a shared fence.
 2. D3D12 `Wait` on that fence → decode pass (sRGB → linear RGBA16F, optional 2×2 average for the
    half-resolution mode) + a 32×32 luma thumbnail (read back, 4 KB, to skip unchanged pictures).
 3. `RecordEncodeSrgb` (what the model expects) → NVOF motion vectors (previous frame → current) →
@@ -90,3 +98,8 @@ Measured: 52–68 fps at 1352×1056 (frame 13 ms, four CPU-GPU syncs of which mo
 - `UpdateLayeredWindow` from numpy tops out around 20 fps at 1.4 MP; fine as a fallback.
 - Letting the overlay draw only when the view is stable ("hide while orbiting") reads as flicker
   and was rejected by the user; the overlay now follows continuously.
+- A `WS_EX_TOPMOST` overlay plus a "hide when another window is in front" heuristic: it leaked over
+  other applications whenever the heuristic misjudged, and vanished the moment a screenshot tool
+  opened its own window. Replaced by an *owned* popup of the Blender window (`hWndParent` = Blender):
+  Windows itself keeps it directly above Blender, under anything that covers Blender, and hides it
+  when Blender is minimised. `scripts/test_zorder.py` checks all three with a BitBlt of the screen.

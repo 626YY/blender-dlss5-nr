@@ -17,14 +17,17 @@ viewport / F12 processing with an A/B split slider.
 
 | Mode | How | Speed (RTX 4080 SUPER, 1353×1056 viewport) |
 |---|---|---|
-| **Live — GPU route** | `dlss5_live.exe`: DXGI Desktop Duplication → D3D12 → NVOF motion vectors → NGX feature 18 → composite → DirectComposition overlay. No pixel leaves the GPU. | **52–68 fps** full res, 75–95 fps half res; the model itself takes 2–4 ms |
+| **Live — GPU route** | `dlss5_live.exe`: Windows.Graphics.Capture of the Blender window (or DXGI Desktop Duplication) → D3D12 → NVOF motion vectors → NGX feature 18 → composite → DirectComposition overlay. No pixel leaves the GPU. | **52–68 fps** full res, 75–95 fps half res; the model itself takes 2–4 ms |
 | **Live — CPU route** | Python worker: `PrintWindow` → numpy → ComfyUI-DLSS5-NR's bridge DLL → GDI layered window | ~10 fps full res, ~20 fps half res |
 | **Single frame** | GPU offscreen capture of the viewport at 2× → NR → overlay with split slider | ~1 s |
 | **F12 result** | Processes the last render, writes `DLSS5_NR` image, saves PNG | ~1 s |
 
-The overlay is a topmost, click-through window that sits exactly over the 3D viewport: EEVEE keeps
-running at full speed underneath, you orbit/edit as usual, the NR view follows. A draggable yellow
-split line compares original (left) and NR (right); Blender's own panels are cut out of the overlay.
+The overlay is a click-through window **owned by the Blender window**, sitting exactly over the 3D
+viewport: EEVEE keeps running at full speed underneath, you orbit/edit as usual, the NR view follows.
+Because it is owned, Windows keeps it in Blender's z-order: whatever covers Blender covers it, it
+minimises with Blender, and it never shows over other applications. Screen recorders and screenshot
+tools see it like any other window. A draggable yellow split line compares original (left) and NR
+(right); Blender's own panels are cut out of the overlay.
 
 Three composite modes: **keep original colour** (model luminance detail on your colours — default),
 **full NR** (the model's output incl. its relighting), **detail only** (high-frequency detail added
@@ -56,6 +59,11 @@ back to your lighting; CPU route / single frame only).
   compare; the three buttons switch *split / NR only / original*. Half-resolution mode doubles the
   frame rate; on the GPU route full resolution is already real-time.
 - **单帧 / Single**: one high-quality frame (2× supersampled capture), same split compare.
+- **Recording**: with the default per-window capture (*高级 → 抓取方式 → 按窗口*) OBS / screenshot
+  tools record the overlay. Windows 10 draws a yellow border around a window that is being captured
+  this way (Windows 11 lets the app turn it off). If the border bothers you, switch to *桌面复制*
+  (desktop duplication): no border, but the overlay must then exclude itself from capture, so
+  recorders will not see it.
 - **渲染结果 / F12**: after a render, *NR 上一帧渲染*, then *另存 PNG*.
 - **风格 / Style presets**: the model only has three real styles (0/1/2 — indices 3+ are identical
   to 2); the presets combine style × tone × structure × skin × composite mode. See
@@ -107,7 +115,7 @@ NR 画面以 50–60 帧跟着动；另有单帧高清、F12 结果处理，带�
 > 不在本仓库里，RTX 40 只能靠社区改版跑。所有 NGX 代码都在独立进程里执行，崩了不会带走 Blender。
 
 **两条路：**
-- **GPU 路** `dlss5_live.exe`（C++）：桌面复制 → D3D12 → NVOF 运动矢量 → NGX → 合成 → DirectComposition
+- **GPU 路** `dlss5_live.exe`（C++）：按窗口抓取（Windows.Graphics.Capture，可切桌面复制）→ D3D12 → NVOF 运动矢量 → NGX → 合成 → DirectComposition
   浮窗，全程不下 GPU。4080 SUPER 上 1353×1056 全分辨率 52–68 帧，半分辨率 75–95 帧，模型本身 2–4 ms。
 - **CPU 路**（Python 工作进程）：PrintWindow → numpy → ComfyUI-DLSS5-NR 的桥 DLL → GDI 分层窗，约 10–20 帧。
   没有 exe 时自动退回这条路。
@@ -118,6 +126,10 @@ NR 画面以 50–60 帧跟着动；另有单帧高清、F12 结果处理，带�
 **用法：** 「实时」开关浮窗，拖黄线对比，三个按钮切 分割/只看 NR/只看原图；「单帧」出一张 2× 超采样的高清
 对比；F12 之后用「NR 上一帧渲染」「另存 PNG」。风格预设 = 模型风格 × 色调 × 结构 × 皮肤 × 合成方式的组合
 （模型真正的风格只有 3 种；`intensity` 和 `preset` 两个参数实测无效）。
+
+**浮窗与录屏：** 浮窗是 Blender 窗口的从属窗口，只会出现在 Blender 正上方：别的窗口盖住 Blender 它就一起被盖住，
+Blender 最小化它也跟着藏，不会漏到别的程序上面；录屏 / 截图软件能正常录到它。Win10 上「按窗口」抓取会有系统画的
+黄色边框（Win11 可以关掉），嫌碍事就到「高级 → 抓取方式」切「桌面复制」，但那样浮窗对录屏就是隐形的。
 
 **编译 GPU 路：** 见上面的命令和 [docs/BUILD.md](docs/BUILD.md)（无管理员权限可以用便携 MSVC）。
 

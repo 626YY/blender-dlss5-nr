@@ -57,7 +57,7 @@ from . import nr_math
 bl_info = {
     "name": "DLSS 5 神经渲染 + EEVEE 引导通道",
     "author": "built in-session",
-    "version": (0, 10, 0),
+    "version": (0, 10, 1),
     "blender": (5, 0, 0),
     "location": "3D 视图 > 侧边栏 > DLSS NR",
     "description": "DLSS 5 神经渲染(视口 / F12 结果),以及 EEVEE 引导通道捕获",
@@ -718,7 +718,8 @@ def _live_cfg(win, area, region, settings):
                 structure=float(settings.nr_structure), skin=float(settings.nr_skin),
                 automask=bool(settings.nr_automask), mode=settings.nr_mode,
                 strength=float(settings.nr_strength), half=bool(settings.nr_live_half),
-                split=float(settings.nr_split), view=settings.nr_view), (rx, ry, rw, rh)
+                split=float(settings.nr_split), view=settings.nr_view,
+                capture=("dda" if settings.nr_live_capture == "DDA" else "wgc")), (rx, ry, rw, rh)
 
 
 def _live_send(action, cfg=None):
@@ -1831,6 +1832,12 @@ class DLSSNR_Settings(PropertyGroup):
                               description="让模型自动判断哪些区域应用效果",
                               update=_on_model_param_change)
     nr_live: BoolProperty(name="实时模式", default=False, options={"SKIP_SAVE"})
+    nr_live_capture: EnumProperty(
+        name="GPU 路抓取方式",
+        items=[("WGC", "按窗口(可录屏)", "Windows.Graphics.Capture 只抓 Blender 窗口:录屏/截图都能看到浮窗;"
+                                         "Win10 会在 Blender 窗口边缘画一圈黄色捕获边框(Win11 没有)"),
+               ("DDA", "桌面复制(无黄框)", "抓整个桌面,浮窗必须对录屏隐藏(否则会把自己再喂给自己)")],
+        default="WGC")
     nr_route: EnumProperty(
         name="实时路线",
         items=[("AUTO", "自动", "有 dlss5_live.exe 就走 GPU 路,否则 CPU 路"),
@@ -1908,7 +1915,7 @@ class DLSSNR_PT_panel(Panel):
         elif _Live.enabled:
             layout.label(text="%s · %.1f 帧/秒 · NR %.1fms%s" % (
                 "GPU" if _Live.route == "gpu" else "CPU", _Live.fps, _Live.nr_ms,
-                "" if _Live.visible else " · 视口被挡住/未激活"), icon="TIME")
+                "" if _Live.visible else " · 等待画面"), icon="TIME")
             layout.prop(s, "nr_live_half", text="半分辨率(更流畅)")
 
         if _Overlay.tex is not None or _Live.enabled:
@@ -1958,6 +1965,7 @@ class DLSSNR_PT_advanced(Panel):
         col.prop(s, "nr_automask")
         col = layout.column(align=True)
         col.prop(s, "nr_route")
+        col.prop(s, "nr_live_capture")
         col.prop(s, "nr_live_exe", text="")
         col = layout.column(align=True)
         col.prop(s, "nr_scale", text="单帧倍率")

@@ -49,7 +49,7 @@ if not exist "!NGXLIB!" (
 )
 set "COMMON=/nologo /std:c++17 /EHsc /W3 !OPT! /D_CRT_SECURE_NO_WARNINGS /utf-8"
 set "INCLUDES=/I "%V2D%third_party\nvngx\include" /I "%V2D%third_party\stb" /I "%V2D%third_party\nvof" /I "%V2D%src" /I "%V2D%forwarder" /I "%ROOT%.""
-set "LIBS=d3d12.lib d3d11.lib dxgi.lib d3dcompiler.lib dxguid.lib dcomp.lib advapi32.lib user32.lib version.lib shell32.lib"
+set "LIBS=d3d12.lib d3d11.lib dxgi.lib d3dcompiler.lib dxguid.lib dcomp.lib dwmapi.lib windowsapp.lib advapi32.lib user32.lib version.lib shell32.lib"
 set "SHARED=%V2D%src\common.cpp %V2D%src\image.cpp %V2D%src\gpu.cpp %V2D%src\dlss.cpp %V2D%src\cli.cpp %V2D%src\pipeline.cpp %V2D%src\nr.cpp %V2D%src\archspoof.cpp %V2D%src\optflow.cpp %V2D%src\optflow_nvof.cpp %V2D%src\slprobe.cpp"
 
 echo Building dlss5_live [%CFG%]...

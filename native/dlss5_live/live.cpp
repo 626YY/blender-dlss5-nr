@@ -3,7 +3,16 @@
 
 #include <d3d11_4.h>
 #include <dcomp.h>
+#include <dwmapi.h>
 #include <dxgi1_2.h>
+
+// Windows.Graphics.Capture (per-window capture) via C++/WinRT.
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Graphics.Capture.h>
+#include <winrt/Windows.Graphics.DirectX.Direct3D11.h>
+#include <Windows.Graphics.Capture.Interop.h>
+#include <windows.graphics.directx.direct3d11.interop.h>
 
 #include <algorithm>
 #include <array>
@@ -48,6 +57,7 @@ struct Cfg {
     float detail = 1.0f;
     float colour = 0.0f;         // 0 keep original hue (COLOR mode), 1 model colour (FULL)
     bool bench = false;
+    bool preferWgc = true;       // per-window capture (recorders see the overlay; Win10 draws a yellow border)
     std::string dump;            // debug: write the next presented frame to this PNG path
     unsigned gen = 0;            // any change -> re-present
     unsigned modelGen = 0;       // model params changed -> re-create the feature
@@ -154,6 +164,7 @@ void ApplyCfg(const JVal& j, Cfg& c) {
     }
     c.half = j.boolean("half", c.half);
     c.bench = j.boolean("bench", c.bench);
+    if (j.has("capture")) c.preferWgc = (j.str("capture", "wgc") != "dda");
     if (j.has("dump")) c.dump = j.str("dump", "");
     // composition
     if (j.has("mode")) {
@@ -325,7 +336,121 @@ public:
     int Width() const { return m_w; }
     int Height() const { return m_h; }
 
+    // ---- Windows.Graphics.Capture: capture one window (Blender) regardless of what is on top ----
+    bool Wgc() const { return m_wgc; }
+    bool StartWgc(HWND hwnd, std::string* err) {
+        namespace wgc = winrt::Windows::Graphics::Capture;
+        namespace wdx = winrt::Windows::Graphics::DirectX;
+        StopWgc();
+        try {
+            auto interop = winrt::get_activation_factory<wgc::GraphicsCaptureItem, IGraphicsCaptureItemInterop>();
+            wgc::GraphicsCaptureItem item{nullptr};
+            winrt::check_hresult(interop->CreateForWindow(hwnd, winrt::guid_of<wgc::GraphicsCaptureItem>(),
+                                                          winrt::put_abi(item)));
+            if (!m_winrtDevice) {
+                ComPtr<IDXGIDevice> dxgi;
+                CHECK_HR(m_dev.As(&dxgi));
+                winrt::com_ptr<IInspectable> insp;
+                winrt::check_hresult(CreateDirect3D11DeviceFromDXGIDevice(dxgi.Get(), insp.put()));
+                m_winrtDevice = insp.as<wdx::Direct3D11::IDirect3DDevice>();
+            }
+            m_poolSize = item.Size();
+            m_pool = wgc::Direct3D11CaptureFramePool::CreateFreeThreaded(
+                m_winrtDevice, wdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, m_poolSize);
+            m_session = m_pool.CreateCaptureSession(item);
+            try { m_session.IsCursorCaptureEnabled(false); } catch (...) {}
+            // The yellow capture border: Windows 11 lets an unpackaged app ask for borderless capture;
+            // Windows 10 (up to 22H2) does not, so the border stays there.
+            try {
+                wgc::GraphicsCaptureAccess::RequestAccessAsync(wgc::GraphicsCaptureAccessKind::Borderless).get();
+            } catch (...) {}
+            try { m_session.IsBorderRequired(false); } catch (...) { LogWarn("WGC: this Windows build keeps the yellow capture border"); }
+            m_session.StartCapture();
+            m_item = item;
+            m_wgcHwnd = hwnd;
+            m_wgc = true;
+            return true;
+        } catch (const winrt::hresult_error& e) {
+            *err = "WGC: " + Widen2Narrow(std::wstring(e.message()));
+        } catch (const std::exception& e) {
+            *err = std::string("WGC: ") + e.what();
+        }
+        StopWgc();
+        return false;
+    }
+    void StopWgc() {
+        try {
+            if (m_session) m_session.Close();
+            if (m_pool) m_pool.Close();
+        } catch (...) {}
+        m_session = nullptr;
+        m_pool = nullptr;
+        m_item = nullptr;
+        m_wgc = false;
+        m_wgcHwnd = nullptr;
+    }
+    // l,t,w,h are Blender client coordinates. 1 = copied, 0 = no new frame, -1 = lost.
+    int AcquireWgc(HWND hwnd, int l, int t, int w, int h, bool force, std::string* err) {
+        namespace wdx = winrt::Windows::Graphics::DirectX;
+        if (!m_wgc || hwnd != m_wgcHwnd) return -1;
+        if (!EnsureShared(w, h, err)) return -1;
+        try {
+            auto frame = m_pool.TryGetNextFrame();
+            if (!frame) {
+                if (force && m_haveFrame) {          // bench: reuse the last copy as if it were new
+                    m_ctx4->Signal(m_fence11.Get(), ++m_fenceVal);
+                    return 1;
+                }
+                return 0;
+            }
+            auto size = frame.ContentSize();
+            if (size.Width != m_poolSize.Width || size.Height != m_poolSize.Height) {
+                m_poolSize = size;
+                m_pool.Recreate(m_winrtDevice, wdx::DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
+                frame.Close();
+                return 0;
+            }
+            auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
+            winrt::com_ptr<ID3D11Texture2D> tex;
+            winrt::check_hresult(access->GetInterface(winrt::guid_of<ID3D11Texture2D>(), tex.put_void()));
+            // The captured image starts at the window's visible frame bounds; map client coords into it.
+            RECT wr{};
+            if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &wr, sizeof(wr)))) GetWindowRect(hwnd, &wr);
+            POINT co{0, 0};
+            ClientToScreen(hwnd, &co);
+            const int ox = co.x - wr.left + l, oy = co.y - wr.top + t;
+            D3D11_BOX box{};
+            box.left = static_cast<UINT>(std::max(0, ox));
+            box.top = static_cast<UINT>(std::max(0, oy));
+            box.right = static_cast<UINT>(std::min<int>(size.Width, ox + w));
+            box.bottom = static_cast<UINT>(std::min<int>(size.Height, oy + h));
+            box.front = 0;
+            box.back = 1;
+            int result = 0;
+            if (box.right > box.left && box.bottom > box.top) {
+                m_ctx->CopySubresourceRegion(m_shared.Get(), 0, 0, 0, 0, tex.get(), 0, &box);
+                m_ctx->Flush();
+                m_ctx4->Signal(m_fence11.Get(), ++m_fenceVal);
+                m_haveFrame = true;
+                result = 1;
+            }
+            frame.Close();
+            return result;
+        } catch (const winrt::hresult_error& e) {
+            *err = "WGC frame: " + Widen2Narrow(std::wstring(e.message()));
+            return -1;
+        }
+    }
+
 private:
+    winrt::Windows::Graphics::Capture::GraphicsCaptureItem m_item{nullptr};
+    winrt::Windows::Graphics::Capture::Direct3D11CaptureFramePool m_pool{nullptr};
+    winrt::Windows::Graphics::Capture::GraphicsCaptureSession m_session{nullptr};
+    winrt::Windows::Graphics::DirectX::Direct3D11::IDirect3DDevice m_winrtDevice{nullptr};
+    winrt::Windows::Graphics::SizeInt32 m_poolSize{};
+    HWND m_wgcHwnd = nullptr;
+    bool m_wgc = false;
+    bool m_haveFrame = false;
     static bool Intersects(const RECT& a, const RECT& b) {
         return !(a.right <= b.left || a.left >= b.right || a.bottom <= b.top || a.top >= b.bottom);
     }
@@ -583,26 +708,39 @@ void Barrier(ID3D12GraphicsCommandList* cl, ID3D12Resource* r, D3D12_RESOURCE_ST
 }
 
 // ---------------------------------------------------------------------------
-// The overlay window: click-through, topmost, DirectComposition swap chain (premultiplied alpha).
+// The overlay window: click-through popup owned by the Blender window, DirectComposition swap chain.
 // ---------------------------------------------------------------------------
 constexpr DWORD kWdaExcludeFromCapture = 0x11;
 
 class Overlay {
 public:
-    bool Create(std::string* err) {
+    // The overlay is an *owned* popup of the Blender window: Windows keeps it directly above its
+    // owner in z-order, hides it when the owner is minimised, and puts it behind whatever covers
+    // Blender. So it never leaks over other applications, and no foreground heuristics are needed.
+    bool Create(HWND owner, std::string* err) {
+        if (m_hwnd && owner == m_owner) return true;
+        Destroy();
         WNDCLASSW wc{};
         wc.lpfnWndProc = DefWindowProcW;
         wc.hInstance = GetModuleHandleW(nullptr);
         wc.lpszClassName = L"DLSS5_Live_Overlay";
         RegisterClassW(&wc);
-        const DWORD ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
+        const DWORD ex = WS_EX_NOREDIRECTIONBITMAP | WS_EX_LAYERED | WS_EX_TRANSPARENT |
                          WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
         m_hwnd = CreateWindowExW(ex, L"DLSS5_Live_Overlay", L"DLSS 5 NR (GPU)", WS_POPUP, 0, 0, 8, 8,
-                                 nullptr, nullptr, wc.hInstance, nullptr);
-        if (!m_hwnd) { *err = "CreateWindowExW failed"; return false; }
+                                 owner, nullptr, wc.hInstance, nullptr);
+        if (!m_hwnd) { *err = "CreateWindowExW failed: " + std::to_string(GetLastError()); return false; }
+        m_owner = owner;
         SetLayeredWindowAttributes(m_hwnd, 0, 255, LWA_ALPHA);
-        m_affinityOk = SetWindowDisplayAffinity(m_hwnd, kWdaExcludeFromCapture) != 0;
         return true;
+    }
+    HWND Owner() const { return m_owner; }
+    bool Visible() const { return m_hwnd && IsWindowVisible(m_hwnd) != 0; }
+    // Only needed with desktop duplication (otherwise the overlay would capture itself). With
+    // per-window capture the overlay stays visible to screen recorders.
+    bool SetExcludeFromCapture(bool on) {
+        m_affinityOk = SetWindowDisplayAffinity(m_hwnd, on ? kWdaExcludeFromCapture : 0) != 0;
+        return m_affinityOk;
     }
     bool AffinityOk() const { return m_affinityOk; }
 
@@ -653,8 +791,8 @@ public:
     void Present() { m_sc->Present(1, 0); }
 
     void Place(int x, int y, int w, int h, bool show) {
-        SetWindowPos(m_hwnd, HWND_TOPMOST, x, y, w, h,
-                     SWP_NOACTIVATE | (show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
+        SetWindowPos(m_hwnd, nullptr, x, y, w, h,
+                     SWP_NOACTIVATE | SWP_NOZORDER | (show ? SWP_SHOWWINDOW : SWP_HIDEWINDOW));
         m_shown = show;
     }
     void Hide() {
@@ -679,10 +817,14 @@ public:
         m_dcomp.Reset();
         if (m_hwnd) DestroyWindow(m_hwnd);
         m_hwnd = nullptr;
+        m_owner = nullptr;
+        m_w = m_h = 0;
+        m_shown = false;
     }
 
 private:
     HWND m_hwnd = nullptr;
+    HWND m_owner = nullptr;
     ComPtr<IDXGISwapChain3> m_sc;
     ComPtr<ID3D12Resource> m_back[2];
     ComPtr<IDCompositionDevice> m_dcomp;
@@ -693,18 +835,6 @@ private:
     bool m_affinityOk = false;
 };
 
-bool CoveredByOther(HWND blender, HWND ours, const RECT& screenRect) {
-    HWND fg = GetForegroundWindow();
-    if (!fg) return false;
-    HWND root = GetAncestor(fg, GA_ROOT);
-    if (!root) root = fg;
-    if (root == blender || fg == blender || fg == ours || root == ours) return false;
-    RECT r{};
-    if (!GetWindowRect(root, &r)) return false;
-    return !(r.right <= screenRect.left || r.left >= screenRect.right || r.bottom <= screenRect.top ||
-             r.top >= screenRect.bottom);
-}
-
 }  // namespace
 
 // ---------------------------------------------------------------------------
@@ -712,6 +842,11 @@ int RunLive(const LiveArgs& args) {
     SetLogToStderr(true);
     SetVerbose(args.verbose);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    try {
+        winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    } catch (...) {
+        // already initialised by someone else in this thread: fine
+    }
 
     Cfg cfg;
     cfg.model.style = 2;
@@ -748,10 +883,7 @@ int RunLive(const LiveArgs& args) {
         if (!fwd.Load()) throw ToolError("forwarder nvngx.dll_dlssnr.dll not found next to the exe");
         std::string err;
         if (!cap.Init(gpu.Adapter(), gpu.Device(), &err)) throw ToolError(err);
-        if (!args.headless && !overlay.Create(&err)) throw ToolError(err);
         passes.Init(gpu.Device());
-        if (!args.headless && !overlay.AffinityOk())
-            LogWarn("SetWindowDisplayAffinity(EXCLUDEFROMCAPTURE) failed: the overlay may feed back into the capture");
         LogInfo("ready (snippet %s)", Widen2Narrow(SnippetPath(args.dllDir)).c_str());
         Reply("{\"ok\":1,\"route\":\"gpu\",\"gpu\":\"" + JEscape(gpu.AdapterName()) + "\"}");
     } catch (const std::exception& e) {
@@ -776,6 +908,9 @@ int RunLive(const LiveArgs& args) {
     std::vector<double> stamps;
     auto lastStat = std::chrono::steady_clock::now();
     HMONITOR curMon = nullptr;
+    HWND capHwnd = nullptr;          // window the capture (WGC or DDA) is bound to
+    bool capWgcPref = true;
+    bool useDda = false;             // fallback when WGC is unavailable or not wanted
 
     auto releaseFeature = [&]() {
         if (feature) {
@@ -812,18 +947,34 @@ int RunLive(const LiveArgs& args) {
             }
             w &= ~1;
             h &= ~1;
+            if (!args.headless) stats.visible = overlay.Visible();   // Windows re-shows it with a restored owner
             POINT org{l, t};
             ClientToScreen(c.hwnd, &org);
             RECT screen{org.x, org.y, org.x + w, org.y + h};
-            if (!args.headless && CoveredByOther(c.hwnd, overlay.Hwnd(), screen)) {
-                overlay.Hide();
-                stats.visible = false;
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
+            std::string err;
+            // The overlay window is owned by the Blender window (created once we know it).
+            if (!args.headless && overlay.Owner() != c.hwnd) {
+                if (!overlay.Create(c.hwnd, &err)) throw ToolError(err);
+            }
+            // Capture backend, bound to the Blender window: per-window capture first (recorders can
+            // see the overlay), desktop duplication + self-exclusion as the fallback.
+            if (capHwnd != c.hwnd || capWgcPref != c.preferWgc) {
+                capHwnd = c.hwnd;
+                capWgcPref = c.preferWgc;
+                useDda = !c.preferWgc || !cap.StartWgc(c.hwnd, &err);
+                if (useDda) {
+                    cap.StopWgc();
+                    if (c.preferWgc) LogWarn("%s -> falling back to desktop duplication", err.c_str());
+                    LogInfo("capture: desktop duplication (overlay excluded from screen recorders)");
+                    if (!args.headless) overlay.SetExcludeFromCapture(true);
+                    curMon = nullptr;
+                } else {
+                    LogInfo("capture: Windows.Graphics.Capture of the Blender window");
+                    if (!args.headless) overlay.SetExcludeFromCapture(false);
+                }
             }
             HMONITOR mon = MonitorFromWindow(c.hwnd, MONITOR_DEFAULTTONEAREST);
-            std::string err;
-            if (mon != curMon || cap.Monitor() != mon) {
+            if (useDda && (mon != curMon || cap.Monitor() != mon)) {
                 if (!cap.SelectOutput(mon, &err)) throw ToolError(err);
                 curMon = mon;
             }
@@ -864,6 +1015,7 @@ int RunLive(const LiveArgs& args) {
                 haveFinal = false;
             }
             if (!args.headless && (sizeChanged || !overlay.HasSwapChain())) {
+                // (re)created together with the window: the DComp target is per HWND
                 ComPtr<IDXGIFactory6> factory;
                 CHECK_HR(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)));
                 if (!overlay.EnsureSwapChain(factory.Get(), gpu.Queue(), w, h, &err)) throw ToolError(err);
@@ -885,10 +1037,12 @@ int RunLive(const LiveArgs& args) {
 
             // ---- capture ----
             const auto tCap0 = std::chrono::steady_clock::now();
-            int got = cap.Acquire(screen, c.bench || needReset, &err);
+            int got = useDda ? cap.Acquire(screen, c.bench || needReset, &err)
+                             : cap.AcquireWgc(c.hwnd, l, t, w, h, c.bench || needReset, &err);
             if (got < 0) {
-                if (!err.empty()) LogWarn("capture: %s (re-duplicating)", err.c_str());
+                if (!err.empty()) LogWarn("capture: %s (restarting capture)", err.c_str());
                 curMon = nullptr;
+                capHwnd = nullptr;
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 continue;
             }
@@ -1014,8 +1168,7 @@ int RunLive(const LiveArgs& args) {
                     cfg.dump.clear();
                 }
                 overlay.Present();
-                if (!overlay.Shown()) overlay.Place(screen.left, screen.top, w, h, true);
-                else SetWindowPos(overlay.Hwnd(), HWND_TOPMOST, screen.left, screen.top, w, h, SWP_NOACTIVATE);
+                overlay.Place(screen.left, screen.top, w, h, true);
                 stats.visible = true;
             }
             presentedGen = c.gen;
@@ -1033,6 +1186,12 @@ int RunLive(const LiveArgs& args) {
                 }
                 stats.SetErr("");
             }
+        } catch (const winrt::hresult_error& e) {
+            const std::string msg = "WinRT: " + Widen2Narrow(std::wstring(e.message()));
+            LogErr("%s", msg.c_str());
+            stats.SetErr(msg);
+            capHwnd = nullptr;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         } catch (const std::exception& e) {
             LogErr("%s", e.what());
             stats.SetErr(e.what());
@@ -1046,6 +1205,7 @@ int RunLive(const LiveArgs& args) {
 
     stats.running = false;
     quit = true;
+    cap.StopWgc();
     if (!args.headless) overlay.Destroy();
     releaseFeature();
     nvof.Shutdown();
